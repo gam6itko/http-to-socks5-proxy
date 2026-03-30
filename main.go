@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
+
+	"github.com/caarlos0/env/v11"
+	"go.uber.org/zap"
 )
 
 // hop-by-hop headers
@@ -26,6 +29,42 @@ var hopHeaders = []string{
 
 type RewriteTransport struct {
 	Transport http.RoundTripper
+}
+
+type Config struct {
+	ServerURL      string `env:"SERVER_URL" envDefault:"0.0.0.0:8080"`
+	ProxyDSN       string `env:"PROXY_DSN,required"`
+	TargetHost     string `env:"TARGET_HOST,required"`
+	IgnoreSSL      bool   `env:"IGNORE_SSL" envDefault:"false"`
+	DefaultHeaders map[string]string
+}
+
+func LoadConfig() (Config, error) {
+	cfg := Config{}
+	if err := env.Parse(&cfg); err != nil {
+		return Config{}, err
+	}
+
+	headers := os.Getenv("DEFAULT_HEADERS")
+	cfg.DefaultHeaders = make(map[string]string)
+	if headers == "" {
+		return cfg, nil
+	}
+
+	for _, header := range strings.Split(headers, ",") {
+		parts := strings.SplitN(header, ":", 2)
+		if len(parts) != 2 {
+			return Config{}, fmt.Errorf("invalid DEFAULT_HEADERS entry: %q", header)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key == "" {
+			return Config{}, fmt.Errorf("invalid DEFAULT_HEADERS entry: empty key")
+		}
+		cfg.DefaultHeaders[key] = value
+	}
+
+	return cfg, nil
 }
 
 func (t *RewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -57,7 +96,7 @@ func containsHeader(s string, list []string) bool {
 	return false
 }
 
-func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[string]string) http.Handler {
+func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[string]string, logger *zap.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// get path from request and append to target url
 		target, _ := url.Parse(targetHost + r.URL.Path)
@@ -65,10 +104,19 @@ func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[
 			target.RawQuery = r.URL.RawQuery
 		}
 
+		var buf bytes.Buffer
+		rBody := io.TeeReader(r.Body, &buf)
+
+		logger.Debug("proxy request",
+			zap.String("method", r.Method),
+			zap.String("url", target.String()),
+			zap.ByteString("reqBody", buf.Bytes()),
+		)
+
 		// create new request
-		req, err := http.NewRequest(r.Method, target.String(), r.Body)
+		req, err := http.NewRequest(r.Method, target.String(), rBody)
 		if err != nil {
-			log.Println(err)
+			logger.Error("new request", zap.Error(err))
 			return
 		}
 
@@ -87,9 +135,14 @@ func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[
 		// send request to target url
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Println(err)
+			logger.Error("proxy request", zap.Error(err))
 			return
 		}
+		defer func() {
+			if err = resp.Body.Close(); err != nil {
+				logger.Error("close response body", zap.Error(err))
+			}
+		}()
 
 		// copy headers from response to original response
 		for k, v := range resp.Header {
@@ -99,62 +152,42 @@ func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[
 		// copy status code from response to original response
 		w.WriteHeader(resp.StatusCode)
 
-		// copy body from response to original response using io.Copy
-		_, err = io.Copy(w, resp.Body)
-		if err != nil {
-			log.Println(err)
-			return
-		}
+		// Используем для лога
+		buf.Reset()
+		respBody := io.TeeReader(resp.Body, &buf)
 
-		// close response body
-		err = resp.Body.Close()
+		logger.Debug("proxy response",
+			zap.String("method", r.Method),
+			zap.String("url", target.String()),
+			zap.Int("status", resp.StatusCode),
+			zap.ByteString("respBody", buf.Bytes()),
+		)
+
+		// copy body from response to original response using io.Copy
+		_, err = io.Copy(w, respBody)
 		if err != nil {
-			log.Println(err)
+			logger.Error("copy response body", zap.Error(err))
 			return
 		}
 	})
 }
 
 func main() {
-	// get server url from env
-	serverUrl := os.Getenv("SERVER_URL")
-	if serverUrl == "" {
-		serverUrl = "0.0.0.0:8080"
-	}
-
-	// get socks5 proxy from env
-	proxyUrl := os.Getenv("PROXY_DSN")
-	if proxyUrl == "" {
-		log.Fatal("PROXY_DSN is not set")
-	}
-
-	targetHost := os.Getenv("TARGET_HOST")
-	if targetHost == "" {
-		log.Fatal("TARGET_HOST is not set")
-	}
-
-	ignoreSsl := os.Getenv("IGNORE_SSL")
-	if ignoreSsl == "" {
-		ignoreSsl = "false"
-	}
-	ignoreSslBool, err := strconv.ParseBool(ignoreSsl)
+	logger, err := zap.NewDevelopment()
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
+	}
+	defer func() { _ = logger.Sync() }()
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		logger.Fatal("load config", zap.Error(err))
 	}
 
-	// get default headers from env
-	// example: "Content-Type:application/json,Authorization...."
-	headersMap := make(map[string]string)
-	headers := os.Getenv("DEFAULT_HEADERS")
-	if headers != "" {
-		for _, header := range strings.Split(headers, ",") {
-			headerParts := strings.Split(header, ":")
-			headersMap[headerParts[0]] = headerParts[1]
-		}
-	}
-
-	httpClient := getProxyClient(proxyUrl, ignoreSslBool)
+	httpClient := getProxyClient(cfg.ProxyDSN, cfg.IgnoreSSL)
 
 	//proxy all outgoing http requests to socks5 proxy
-	log.Fatal(http.ListenAndServe(serverUrl, newProxyHandler(httpClient, targetHost, headersMap)))
+	if err := http.ListenAndServe(cfg.ServerURL, newProxyHandler(httpClient, cfg.TargetHost, cfg.DefaultHeaders, logger)); err != nil {
+		logger.Fatal("listen", zap.String("addr", cfg.ServerURL), zap.Error(err))
+	}
 }
