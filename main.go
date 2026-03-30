@@ -104,17 +104,20 @@ func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[
 			target.RawQuery = r.URL.RawQuery
 		}
 
-		var buf bytes.Buffer
-		rBody := io.TeeReader(r.Body, &buf)
+		reqBodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.Error("read request body", zap.Error(err))
+			return
+		}
 
 		logger.Debug("proxy request",
 			zap.String("method", r.Method),
 			zap.String("url", target.String()),
-			zap.ByteString("reqBody", buf.Bytes()),
+			zap.ByteString("reqBody", reqBodyBytes),
 		)
 
 		// create new request
-		req, err := http.NewRequest(r.Method, target.String(), rBody)
+		req, err := http.NewRequest(r.Method, target.String(), bytes.NewReader(reqBodyBytes))
 		if err != nil {
 			logger.Error("new request", zap.Error(err))
 			return
@@ -152,19 +155,21 @@ func newProxyHandler(httpClient *http.Client, targetHost string, headersMap map[
 		// copy status code from response to original response
 		w.WriteHeader(resp.StatusCode)
 
-		// Используем для лога
-		buf.Reset()
-		respBody := io.TeeReader(resp.Body, &buf)
+		respBodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error("read response body", zap.Error(err))
+			return
+		}
 
 		logger.Debug("proxy response",
 			zap.String("method", r.Method),
 			zap.String("url", target.String()),
 			zap.Int("status", resp.StatusCode),
-			zap.ByteString("respBody", buf.Bytes()),
+			zap.ByteString("respBody", respBodyBytes),
 		)
 
 		// copy body from response to original response using io.Copy
-		_, err = io.Copy(w, respBody)
+		_, err = io.Copy(w, bytes.NewReader(respBodyBytes))
 		if err != nil {
 			logger.Error("copy response body", zap.Error(err))
 			return
